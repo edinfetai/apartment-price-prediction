@@ -7,7 +7,7 @@ from math import radians, sin, cos, sqrt, atan2
 # Load trained model and dataset
 # ----------------------------
 model = joblib.load("best_model.pkl")
-df = pd.read_csv("apartments_data_enriched_with_new_features.csv")
+df = pd.read_csv("apartments_data_enriched_lat_lon_combined.csv")
 
 # Basic cleanup
 df["town"] = df["town"].astype(str).str.strip()
@@ -17,7 +17,7 @@ ZURICH_LAT = 47.3769
 ZURICH_LON = 8.5417
 
 # ----------------------------
-# Build postal/town mappings from dataset
+# Build postal/town mappings
 # ----------------------------
 postal_to_town_df = (
     df.groupby(["postalcode", "town"])
@@ -39,6 +39,7 @@ postal_to_town = {
     int(row["postalcode"]): str(row["town"])
     for _, row in postal_to_town_df.iterrows()
 }
+
 town_to_postal = {
     str(row["town"]): int(row["postalcode"])
     for _, row in town_to_postal_df.iterrows()
@@ -47,16 +48,26 @@ town_to_postal = {
 postal_choices = sorted(postal_to_town.keys())
 town_choices = sorted(town_to_postal.keys())
 
-# Representative coordinates per postal code
-postal_geo_df = (
-    df.groupby("postalcode")[["lat", "lon"]]
+# ----------------------------
+# Municipality stats by postal code
+# ----------------------------
+postal_stats_df = (
+    df.groupby("postalcode")[["pop", "pop_dens", "frg_pct", "emp", "tax_income", "lat", "lon"]]
     .median()
     .reset_index()
 )
 
-postal_to_geo = {
-    int(row["postalcode"]): (float(row["lat"]), float(row["lon"]))
-    for _, row in postal_geo_df.iterrows()
+postal_to_stats = {
+    int(row["postalcode"]): {
+        "pop": float(row["pop"]),
+        "pop_dens": float(row["pop_dens"]),
+        "frg_pct": float(row["frg_pct"]),
+        "emp": float(row["emp"]),
+        "tax_income": float(row["tax_income"]),
+        "lat": float(row["lat"]),
+        "lon": float(row["lon"]),
+    }
+    for _, row in postal_stats_df.iterrows()
 }
 
 # ----------------------------
@@ -96,7 +107,8 @@ def predict_price(rooms, area, postalcode, town, features_selected):
             return (
                 "Please enter values for rooms and area.",
                 "—",
-                "Please complete all required fields."
+                "Please complete all required fields.",
+                "—"
             )
 
         rooms = float(rooms)
@@ -106,14 +118,16 @@ def predict_price(rooms, area, postalcode, town, features_selected):
             return (
                 "Area must be greater than 0.",
                 "—",
-                "Please enter a valid apartment size."
+                "Please enter a valid apartment size.",
+                "—"
             )
 
         if postalcode is None:
             return (
                 "Please select a postal code.",
                 "—",
-                "Postal code is required."
+                "Postal code is required.",
+                "—"
             )
 
         postalcode = int(postalcode)
@@ -121,59 +135,66 @@ def predict_price(rooms, area, postalcode, town, features_selected):
         if not town:
             town = postal_to_town.get(postalcode, "")
 
-        # coordinates in background
-        lat, lon = postal_to_geo.get(postalcode, (47.3769, 8.5417))
+        stats = postal_to_stats.get(postalcode)
+        if stats is None:
+            return (
+                "Prediction failed",
+                "—",
+                "No municipality data found for this postal code.",
+                "—"
+            )
 
-        # feature chips -> booleans
+        lat = stats["lat"]
+        lon = stats["lon"]
+        pop = stats["pop"]
+        pop_dens = stats["pop_dens"]
+        frg_pct = stats["frg_pct"]
+        emp = stats["emp"]
+        tax_income = stats["tax_income"]
+
         features_selected = features_selected or []
-        furnished = "Furnished" in features_selected
-        temporary = "Temporary" in features_selected
-        luxurious = "Luxurious" in features_selected
-        zurich_city = "Zurich City" in features_selected
+        is_furnished = 1 if "Furnished" in features_selected else 0
+        is_temporary = 1 if "Temporary" in features_selected else 0
+        is_luxury = 1 if "Luxury" in features_selected else 0
+        is_attika = 1 if "Attika" in features_selected else 0
+        is_loft = 1 if "Loft" in features_selected else 0
 
-        # use first row as feature template
-        row = df.iloc[0].copy()
+        distance_to_center = haversine_distance(lat, lon, ZURICH_LAT, ZURICH_LON)
 
-        # overwrite user-controlled values
-        row["rooms"] = rooms
-        row["area"] = area
-        row["postalcode"] = postalcode
-        row["town"] = town
-        row["lat"] = lat
-        row["lon"] = lon
-        row["furnished"] = furnished
-        row["temporary"] = temporary
-        row["luxurious"] = luxurious
-        row["zurich_city"] = zurich_city
-
-        # recompute engineered values
-        row["room_per_m2"] = rooms / area if area > 0 else 0
-        row["distance_to_center"] = haversine_distance(lat, lon, ZURICH_LAT, ZURICH_LON)
-
-        # unknown at prediction time
-        if "price_per_m2" in row.index:
-            row["price_per_m2"] = 0
-
-        input_data = pd.DataFrame([row])
-
-        if "price" in input_data.columns:
-            input_data = input_data.drop(columns=["price"])
+        input_data = pd.DataFrame([{
+            "rooms": rooms,
+            "area": area,
+            "postalcode": postalcode,
+            "town": town,
+            "pop": pop,
+            "pop_dens": pop_dens,
+            "frg_pct": frg_pct,
+            "emp": emp,
+            "tax_income": tax_income,
+            "distance_to_center": distance_to_center,
+            "is_luxury": is_luxury,
+            "is_temporary": is_temporary,
+            "is_furnished": is_furnished,
+            "is_attika": is_attika,
+            "is_loft": is_loft
+        }])
 
         prediction = float(model.predict(input_data)[0])
 
         price_text = f"CHF {prediction:,.2f}"
         meta_text = f"{rooms:g} rooms • {area:g} m² • {postalcode} {town}"
         detail_text = format_feature_summary(features_selected)
+        distance_text = f"{distance_to_center:.2f} km from Zurich city center"
 
-        return price_text, meta_text, detail_text
+        return price_text, meta_text, detail_text, distance_text
 
     except Exception as e:
         return (
             "Prediction failed",
             "—",
-            f"Error: {str(e)}"
+            f"Error: {str(e)}",
+            "—"
         )
-
 
 # ----------------------------
 # Futuristic styling
@@ -184,13 +205,9 @@ custom_css = """
   --bg2: #140b2d;
   --bg3: #0a1228;
   --glass: rgba(15, 23, 42, 0.60);
-  --glass-strong: rgba(15, 23, 42, 0.82);
   --border: rgba(168, 85, 247, 0.22);
   --text: #f8fafc;
   --muted: #cbd5e1;
-  --cyan: #22d3ee;
-  --purple: #a855f7;
-  --pink: #ec4899;
 }
 
 body, .gradio-container {
@@ -216,7 +233,6 @@ body, .gradio-container {
 #feature-card {
   background: var(--glass) !important;
   backdrop-filter: blur(16px) !important;
-  -webkit-backdrop-filter: blur(16px) !important;
   border: 1px solid var(--border) !important;
   border-radius: 28px !important;
   box-shadow:
@@ -263,18 +279,6 @@ h1, h2, h3, p, label, span, div {
   margin-bottom: 8px !important;
 }
 
-.label-soft {
-  color: #c4b5fd !important;
-  font-size: 13px !important;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  margin-bottom: 8px !important;
-}
-
-.gr-textbox, .gr-number, .gr-dropdown {
-  border-radius: 18px !important;
-}
-
 input, textarea, select {
   background: rgba(15, 23, 42, 0.72) !important;
   border: 1px solid rgba(168,85,247,0.28) !important;
@@ -282,11 +286,6 @@ input, textarea, select {
   border-radius: 18px !important;
   min-height: 54px !important;
   font-size: 17px !important;
-}
-
-input:focus, textarea:focus, select:focus {
-  border-color: rgba(34,211,238,0.75) !important;
-  box-shadow: 0 0 0 3px rgba(34,211,238,0.10) !important;
 }
 
 button.primary, button.lg.primary {
@@ -297,33 +296,6 @@ button.primary, button.lg.primary {
   border-radius: 18px !important;
   min-height: 56px !important;
   font-size: 16px !important;
-  box-shadow: 0 10px 24px rgba(139,92,246,0.28) !important;
-}
-
-button.primary:hover, button.lg.primary:hover {
-  filter: brightness(1.08);
-  transform: translateY(-1px);
-}
-
-.gr-checkboxgroup {
-  gap: 10px !important;
-}
-
-.gr-checkboxgroup label {
-  background: rgba(15, 23, 42, 0.72) !important;
-  border: 1px solid rgba(168,85,247,0.22) !important;
-  border-radius: 999px !important;
-  padding: 10px 14px !important;
-  margin-right: 8px !important;
-  margin-bottom: 10px !important;
-  display: inline-flex !important;
-  align-items: center !important;
-  transition: all .18s ease !important;
-}
-
-.gr-checkboxgroup label:hover {
-  border-color: rgba(34,211,238,0.55) !important;
-  box-shadow: 0 0 18px rgba(34,211,238,0.10) !important;
 }
 
 .result-price textarea,
@@ -338,7 +310,8 @@ button.primary:hover, button.lg.primary:hover {
 }
 
 .result-meta textarea,
-.result-detail textarea {
+.result-detail textarea,
+.result-distance textarea {
   text-align: center !important;
   color: #dbeafe !important;
 }
@@ -347,7 +320,6 @@ footer {
   display: none !important;
 }
 """
-
 
 # ----------------------------
 # UI
@@ -374,14 +346,14 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Soft()) as demo:
 
                 postalcode = gr.Dropdown(
                     choices=postal_choices,
-                    value=8001 if 8001 in postal_choices else postal_choices[0],
+                    value=postal_choices[0],
                     label="Postal Code",
                     interactive=True
                 )
 
                 town = gr.Dropdown(
                     choices=town_choices,
-                    value=postal_to_town.get(8001, town_choices[0]),
+                    value=postal_to_town.get(postal_choices[0], town_choices[0]),
                     label="Town",
                     interactive=True
                 )
@@ -390,8 +362,8 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Soft()) as demo:
                 gr.Markdown('<div class="section-title">Apartment Features</div>')
 
                 features_selected = gr.CheckboxGroup(
-                    choices=["Furnished", "Temporary", "Luxurious", "Zurich City"],
-                    value=["Zurich City"],
+                    choices=["Furnished", "Temporary", "Luxury", "Attika", "Loft"],
+                    value=[],
                     label=""
                 )
 
@@ -417,19 +389,24 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Soft()) as demo:
 
                 output_detail = gr.Textbox(
                     label="Features",
-                    value="Selected: Zurich City",
+                    value="No extra features selected",
                     interactive=False,
                     elem_classes=["result-detail"]
                 )
 
-    # sync postal -> town
+                output_distance = gr.Textbox(
+                    label="Engineered Feature: Distance to Center",
+                    value="—",
+                    interactive=False,
+                    elem_classes=["result-distance"]
+                )
+
     postalcode.change(
         fn=update_town_from_postal,
         inputs=postalcode,
         outputs=town
     )
 
-    # sync town -> postal
     town.change(
         fn=update_postal_from_town,
         inputs=town,
@@ -439,7 +416,7 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Soft()) as demo:
     predict_button.click(
         fn=predict_price,
         inputs=[rooms, area, postalcode, town, features_selected],
-        outputs=[output_price, output_meta, output_detail]
+        outputs=[output_price, output_meta, output_detail, output_distance]
     )
 
 demo.launch()
